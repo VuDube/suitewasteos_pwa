@@ -1,93 +1,161 @@
-/**
- * SuiteWaste OS - minimal service worker
- * - Pre-caches core assets
- * - Network-first fetch strategy with cache fallback
- * - skipWaiting + clients.claim for immediate activation
- *
- * Note: Keep this file small and simple to avoid large SW payloads.
- */
-const CACHE_NAME = 'suitewaste-os-v1';
+const CACHE_VERSION = 'v2';
+const CACHE_NAME = `suitewaste-os-${CACHE_VERSION}`;
+
+// Define the app shell files to pre-cache
 const PRECACHE_URLS = [
   '/',
   '/index.html',
+  '/offline.html',
+  '/manifest.json',
   '/vite.svg',
-  '/manifest.webmanifest'
+  // Add other critical assets like main.tsx.js, index.css, etc. after build
+  // For now, we'll assume they are implicitly handled or added by a build process
+  // or dynamic caching
 ];
+
+// URLs that should always be fetched from the network first
+const NETWORK_FIRST_URLS = [
+    '/api/' // Example for API calls
+];
+
+// Install event: Pre-cache app shell
 self.addEventListener('install', (event) => {
-  // Pre-cache key resources
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => {
+      console.log('[Service Worker] Pre-caching app shell');
       return cache.addAll(PRECACHE_URLS);
     }).then(() => {
-      // Activate this SW immediately on install
+      // Force the waiting service worker to become the active service worker
       return self.skipWaiting();
     })
   );
 });
+
+// Activate event: Clean up old caches and claim clients
 self.addEventListener('activate', (event) => {
-  // Clean up old caches if any and take control of clients
   event.waitUntil(
     (async () => {
+      // Clear old caches
       const cacheNames = await caches.keys();
       await Promise.all(
         cacheNames
           .filter((name) => name !== CACHE_NAME)
           .map((name) => caches.delete(name))
       );
-      await self.clients.claim();
+      console.log('[Service Worker] Old caches cleaned up');
+      // Take control of all clients (tabs) immediately
+      return self.clients.claim();
     })()
   );
 });
-/**
- * Network-first strategy with cache fallback.
- * - For GET requests: try network, put in cache, fallback to cache when offline.
- * - For navigation requests (SPA routing): fallback to cached /index.html
- */
+
+// Fetch event: Hybrid caching strategy
 self.addEventListener('fetch', (event) => {
   const request = event.request;
+  const requestUrl = new URL(request.url);
+
   // Only handle GET requests
   if (request.method !== 'GET') {
     return;
   }
-  event.respondWith((async () => {
-    try {
-      // Try network first
-      const networkResponse = await fetch(request);
-      // Clone and store in cache for offline use (non opaque and successful)
-      // Note: cloning even if opaque; it's fine for basic caching.
-      const cache = await caches.open(CACHE_NAME);
-      try {
-        cache.put(request, networkResponse.clone());
-      } catch (err) {
-        // Some requests (e.g., cross-origin opaque responses) may fail to be cached
-        // Swallow caching errors silently to avoid breaking the fetch.
-        console.warn('Failed to cache request:', request.url, err);
-      }
-      return networkResponse;
-    } catch (err) {
-      // Network failed — try the cache
-      const cachedResponse = await caches.match(request);
-      if (cachedResponse) {
-        return cachedResponse;
-      }
-      // If it's a navigation request (SPA route), return the cached index.html
-      const acceptHeader = request.headers.get('accept') || '';
-      if (request.mode === 'navigate' || acceptHeader.includes('text/html')) {
-        const cachedIndex = await caches.match('/index.html') || await caches.match('/');
-        if (cachedIndex) {
-          return cachedIndex;
+
+  // Check if it's a navigation request (e.g., HTML page)
+  const isNavigation = request.mode === 'navigate' || (request.headers.get('accept') || '').includes('text/html');
+
+  // --- Strategy 1: Cache-First for specific static assets (Stale-While-Revalidate) ---
+  // If it's a static asset (e.g., CSS, JS, images, manifest, pre-cached items)
+  // We'll treat pre-cached URLs as cache-first with revalidation.
+  // This is a simplification; a full SWR would involve responding from cache
+  // then updating cache in the background. For pre-cached, simple cache-first works.
+  if (PRECACHE_URLS.includes(requestUrl.pathname) ||
+      requestUrl.pathname.match(/\.(js|css|png|jpg|jpeg|gif|svg|webp|woff2|woff|ttf|eot)$/i)) {
+    event.respondWith(caches.match(request).then(cachedResponse => {
+      const fetchPromise = fetch(request).then(networkResponse => {
+        // Update the cache with the latest version
+        if (networkResponse.ok) {
+          const responseClone = networkResponse.clone();
+          caches.open(CACHE_NAME).then(cache => {
+            cache.put(request, responseClone);
+          });
         }
-      }
-      // Final fallback: return a minimal offline response
-      return new Response('Offline', {
-        status: 503,
-        statusText: 'Service Unavailable',
-        headers: { 'Content-Type': 'text/plain' }
+        return networkResponse;
+      }).catch(() => {
+        // If network fails for revalidation, but there was no cached response,
+        // we might still need a fallback for *critical* pre-cached items.
+        // For general static assets, failing to revalidate is often fine.
+        console.log(`[Service Worker] Network failed for ${requestUrl.pathname}, serving cached if available.`);
+        return caches.match(request);
       });
-    }
-  })());
+
+      return cachedResponse || fetchPromise; // Serve cached immediately, revalidate in background
+    }));
+    return;
+  }
+
+  // --- Strategy 2: Network-First for navigation requests with offline fallback ---
+  if (isNavigation) {
+    event.respondWith(
+      fetch(request)
+        .then(networkResponse => {
+          // If network is successful, cache the response for future offline use
+          if (networkResponse.ok) {
+            const responseClone = networkResponse.clone();
+            caches.open(CACHE_NAME).then(cache => {
+              cache.put(request, responseClone);
+            });
+          }
+          return networkResponse;
+        })
+        .catch(() => {
+          console.log('[Service Worker] Network failed for navigation, serving offline page.');
+          return caches.match('/offline.html'); // Fallback to offline page
+        })
+    );
+    return;
+  }
+
+  // --- Strategy 3: Network-First with timeout and cache fallback for API/data requests ---
+  // This is a generic network-first for other requests, with a timeout.
+  event.respondWith(
+    (async () => {
+      const API_TIMEOUT = 3000; // 3 seconds timeout for API requests
+
+      try {
+        const networkPromise = fetch(request);
+        const timeoutPromise = new Promise((resolve, reject) =>
+          setTimeout(() => reject(new Error('Network request timed out')), API_TIMEOUT)
+        );
+
+        // Race the network request against the timeout
+        const networkResponse = await Promise.race([networkPromise, timeoutPromise]);
+
+        // If network successful and not timed out
+        if (networkResponse.ok) {
+          const responseClone = networkResponse.clone();
+          caches.open(CACHE_NAME).then(cache => {
+            cache.put(request, responseClone);
+          });
+        }
+        return networkResponse;
+      } catch (error) {
+        console.log(`[Service Worker] Network or timeout failed for ${requestUrl.pathname}:`, error.message);
+        // Fallback to cache
+        const cachedResponse = await caches.match(request);
+        if (cachedResponse) {
+          return cachedResponse;
+        }
+        // If no cache, return a generic offline response or specific error
+        return new Response('API data unavailable offline', {
+          status: 503,
+          statusText: 'Service Unavailable (Offline)',
+          headers: { 'Content-Type': 'text/plain' }
+        });
+      }
+    })()
+  );
 });
-// Optional: Allow pages to message the SW to skip waiting (useful during updates)
+
+// Message listener to allow pages to trigger skipWaiting
 self.addEventListener('message', (event) => {
   if (!event.data) return;
   if (event.data.type === 'SKIP_WAITING') {
